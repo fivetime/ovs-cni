@@ -1,0 +1,109 @@
+name: Sync from upstream
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+# Avoid two runs racing on the push to origin.
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: https://github.com/k8snetworkplumbingwg/ovs-cni.git
+
+jobs:
+  sync:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          # GITHUB_TOKEN cannot push commits/tags that touch workflow files,
+          # which upstream tags routinely do. SYNC_PAT is a PAT with the
+          # 'workflow' scope.
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch upstream --tags --prune
+
+      - name: Sync main
+        run: |
+          # Fast-forward when possible; otherwise merge so fork-local commits
+          # (e.g. our docker workflow customizations) survive. Abort on
+          # conflict so a broken merge never lands on origin/main.
+          if git merge --ff-only upstream/main; then
+            echo "Fast-forwarded main."
+          else
+            echo "Fork main has diverged; merging upstream/main."
+            if ! git merge upstream/main --no-edit -m "Sync upstream main"; then
+              echo "::error::merge conflict on main -- resolve manually"
+              git merge --abort
+              exit 1
+            fi
+          fi
+          git push origin main
+
+      - name: Sync release-* branches
+        run: |
+          # release-* branches in the fork are expected to mirror upstream;
+          # we fast-forward only. A diverged branch is warned and skipped so
+          # one bad branch doesn't fail the whole sync.
+          for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/upstream/release-*); do
+            branch="${ref#upstream/}"
+            echo "::group::Sync ${branch}"
+            if git fetch upstream "${branch}:refs/heads/${branch}"; then
+              git push origin "${branch}" || echo "::warning::push failed for ${branch}"
+            else
+              echo "::warning::${branch} diverged from upstream -- skipped"
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: Push tags
+        id: push_tags
+        run: |
+          # Capture which tags are newly pushed -- the plain git push output
+          # marks them with "[new tag]" lines. Existing tags are not
+          # overwritten (no --force).
+          tmp=$(mktemp)
+          git push origin --tags 2>&1 | tee "$tmp"
+          new_tags=$(grep -oE '\[new tag\][[:space:]]+\S+' "$tmp" | awk '{print $NF}' | tr '\n' ' ')
+          echo "Newly pushed tags: ${new_tags:-(none)}"
+          echo "new_tags=${new_tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch image-push-release.yaml for new v* tags
+        if: steps.push_tags.outputs.new_tags != ''
+        env:
+          # workflow_dispatch via API requires a PAT -- GITHUB_TOKEN cannot
+          # trigger other workflows.
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          # Plain tag push events would use the workflow file at the tag
+          # commit, which predates this fork's customizations. Dispatching
+          # from main makes the build use the current workflow definition
+          # while checking out the tag's code (via the `tag` input).
+          for tag in ${{ steps.push_tags.outputs.new_tags }}; do
+            case "$tag" in
+              v*)
+                echo "Dispatching image-push-release.yaml for ${tag}"
+                gh workflow run image-push-release.yaml --ref main -f "tag=${tag}" \
+                  --repo "${{ github.repository }}" \
+                  || echo "::warning::dispatch failed for ${tag}"
+                ;;
+              *)
+                echo "Skipping non-v* tag: ${tag}"
+                ;;
+            esac
+          done
