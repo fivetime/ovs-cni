@@ -1,11 +1,15 @@
-name: "Push images on merge to main"
+name: "Build image from tags"
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - v*
   workflow_dispatch:
     inputs:
+      tag:
+        description: 'Git tag to check out + image tag (e.g. v0.39.0). Empty = use the dispatched branch ref.'
+        required: false
+        default: ''
       platforms:
         description: 'Which platforms to build'
         required: false
@@ -14,7 +18,7 @@ on:
         options: [all, amd64, arm64, amd64+arm64]
 
 concurrency:
-  group: image-push-main-${{ github.ref }}
+  group: build-from-tags-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -26,8 +30,6 @@ env:
   IMAGE_NAME: ${{ github.repository }}-plugin
 
 jobs:
-  # Resolve which platforms to build. Push events build everything;
-  # workflow_dispatch can scope down via the `platforms` input.
   discover:
     runs-on: ubuntu-latest
     outputs:
@@ -51,7 +53,6 @@ jobs:
             amd64+arm64) m=$(jq -c '[.[]|select(.arch=="amd64" or .arch=="arm64")]' <<<"$all") ;;
             *) echo "::error::unknown platforms input: $p"; exit 1 ;;
           esac
-          # Compact to single line for matrix consumption.
           m=$(jq -c <<<"$m")
           echo "matrix=$m" >> "$GITHUB_OUTPUT"
           {
@@ -60,6 +61,7 @@ jobs:
             echo "| event | ${{ github.event_name }} |"
             echo "|---|---|"
             echo "| ref | ${{ github.ref }} |"
+            echo "| inputs.tag | ${{ inputs.tag }} |"
             echo "| platforms | ${p} |"
             echo ""
             echo '```json'
@@ -83,6 +85,11 @@ jobs:
 
       - name: Check out the repo
         uses: actions/checkout@v6
+        with:
+          # On dispatch with `tag`, check out that historical tag while
+          # running the workflow definition from the dispatched ref (main).
+          # On push events (`inputs.tag` empty), default to the pushed ref.
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up QEMU
         if: matrix.qemu
@@ -107,6 +114,11 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=tag
+            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
 
       - name: Build and push (by digest)
         id: build
@@ -116,21 +128,16 @@ jobs:
           file: ./cmd/Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=main-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=main-${{ matrix.arch }}
-          # provenance/sbom attestations create an extra manifest under the
-          # returned digest, which makes `imagetools create` fail in merge
-          # with "@sha256:... not found". Disable so push-by-digest returns
-          # the actual image manifest digest.
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
+          # See provenance/sbom comment in build-from-main.yaml.
           provenance: false
           sbom: false
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         run: |
-          # Use runner.temp (auto-cleaned per job) instead of /tmp/digests;
-          # on long-lived self-hosted runners /tmp accumulates digests from
-          # every previous job and breaks subsequent merges.
+          # See runner.temp comment in build-from-main.yaml.
           mkdir -p "${RUNNER_TEMP}/digests"
           digest="${{ steps.build.outputs.digest }}"
           touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
@@ -138,7 +145,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v7
         with:
-          name: digests-main-${{ env.PLATFORM_PAIR }}
+          name: digests-release-${{ env.PLATFORM_PAIR }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -151,7 +158,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digests-main-*
+          pattern: digests-release-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -164,14 +171,24 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=tag
+            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
+
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         run: |
           docker buildx imagetools create \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}

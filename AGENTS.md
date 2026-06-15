@@ -86,7 +86,7 @@ make cluster-down       # Tear down cluster
 GitHub Actions workflows in `.github/workflows/`:
 - `lint-build.yaml` - Lint, build, unit tests, CNI tests, and Kubernetes e2e tests
 - `image-build-test.yaml` - Build validation on PRs (multi-arch)
-- `image-push-main.yaml` - Push `:latest` on merge to main
-- `image-push-release.yaml` - Push release tags
+- `build-from-main.yaml` - Push `:latest` on merge to main
+- `build-from-tags.yaml` - Push release tags
 
 Dependabot manages Docker, GitHub Actions, and Go module updates.

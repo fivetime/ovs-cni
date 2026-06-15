@@ -83,7 +83,7 @@ jobs:
           echo "Newly pushed tags: ${new_tags:-(none)}"
           echo "new_tags=${new_tags}" >> "$GITHUB_OUTPUT"
 
-      - name: Dispatch image-push-release.yaml for new v* tags
+      - name: Dispatch build-from-tags.yaml for new v* tags
         if: steps.push_tags.outputs.new_tags != ''
         env:
           # workflow_dispatch via API requires a PAT -- GITHUB_TOKEN cannot
@@ -97,8 +97,8 @@ jobs:
           for tag in ${{ steps.push_tags.outputs.new_tags }}; do
             case "$tag" in
               v*)
-                echo "Dispatching image-push-release.yaml for ${tag}"
-                gh workflow run image-push-release.yaml --ref main -f "tag=${tag}" \
+                echo "Dispatching build-from-tags.yaml for ${tag}"
+                gh workflow run build-from-tags.yaml --ref main -f "tag=${tag}" \
                   --repo "${{ github.repository }}" \
                   || echo "::warning::dispatch failed for ${tag}"
                 ;;
