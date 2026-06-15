@@ -113,7 +113,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ./cmd/Dockerfile
+          file: ./docker/Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=main-${{ matrix.arch }}

@@ -1,0 +1,66 @@
+# Minimal DaemonSet snippet for ovs-cni built from docker/Dockerfile.
+# This is a reference; the canonical manifest lives at manifests/ovs-cni.yml.in.
+#
+# Differences vs. upstream manifest:
+#   - image points at the fivetime fork's GHCR build
+#   - everything else (mounts, security context, install hook) is identical
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ovs-cni-amd64
+  namespace: kube-system
+  labels:
+    tier: node
+    app: ovs-cni
+spec:
+  selector:
+    matchLabels:
+      app: ovs-cni
+  template:
+    metadata:
+      labels:
+        tier: node
+        app: ovs-cni
+    spec:
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: ovs-cni-marker
+          image: ghcr.io/fivetime/ovs-cni-plugin:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/marker"]
+          args:
+            - -node-name
+            - $(NODE_NAME)
+            - -ovs-socket
+            - /host/var/run/openvswitch/db.sock
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: ovs-var-run
+              mountPath: /host/var/run/openvswitch
+      initContainers:
+        - name: ovs-cni-installer
+          image: ghcr.io/fivetime/ovs-cni-plugin:latest
+          command: ["/bin/sh", "-c", "cp /ovs /host/opt/cni/bin/ovs"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: cnibin
+              mountPath: /host/opt/cni/bin
+      volumes:
+        - name: cnibin
+          hostPath:
+            path: /opt/cni/bin
+        - name: ovs-var-run
+          hostPath:
+            path: /var/run/openvswitch
