@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch:
     inputs:
       platforms:
@@ -15,7 +18,7 @@ on:
 
 concurrency:
   group: build-from-main-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true     # dev 构建：同分支新 push 取消旧构建
 
 permissions:
   contents: read
@@ -23,161 +26,74 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}-plugin
 
 jobs:
-  # Resolve which platforms to build. Push events build everything;
-  # workflow_dispatch can scope down via the `platforms` input.
-  discover:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.gen.outputs.matrix }}
+  # docker/Dockerfile 是 Go 交叉编译（FROM --platform=$BUILDPLATFORM），重活在
+  # build 平台上完成；只有 runtime 层 `apk add` 在目标架构跑、需要 QEMU。所以单个
+  # ubuntu-latest + QEMU 就能一次出全部架构，无需原生 runner / 按架构合并 manifest。
+  build:
+    runs-on: ubuntu-latest      # 如有自建 runner 可改为 self-hosted
     steps:
-      - id: gen
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0        # hack/get_version.sh 用 git describe，需要历史和 tag
+
+      - name: Resolve image / sha / platforms
+        id: prep
         run: |
           set -euo pipefail
-          all='[
-            {"platform":"linux/amd64","arch":"amd64","runner":"X64","qemu":false},
-            {"platform":"linux/arm64","arch":"arm64","runner":"X64","qemu":true},
-            {"platform":"linux/ppc64le","arch":"ppc64le","runner":"X64","qemu":true},
-            {"platform":"linux/s390x","arch":"s390x","runner":"X64","qemu":true}
-          ]'
+          echo "image=${REGISTRY}/${GITHUB_REPOSITORY,,}-plugin" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
           p="${{ inputs.platforms }}"
-          [[ -z "$p" ]] && p=all
+          [ -z "$p" ] && p=all
           case "$p" in
-            all)         m="$all" ;;
-            amd64)       m=$(jq -c '[.[]|select(.arch=="amd64")]'                  <<<"$all") ;;
-            arm64)       m=$(jq -c '[.[]|select(.arch=="arm64")]'                  <<<"$all") ;;
-            ppc64le)     m=$(jq -c '[.[]|select(.arch=="ppc64le")]'                <<<"$all") ;;
-            s390x)       m=$(jq -c '[.[]|select(.arch=="s390x")]'                  <<<"$all") ;;
-            amd64+arm64) m=$(jq -c '[.[]|select(.arch=="amd64" or .arch=="arm64")]' <<<"$all") ;;
+            all)         plats="linux/amd64,linux/arm64,linux/ppc64le,linux/s390x" ;;
+            amd64)       plats="linux/amd64" ;;
+            arm64)       plats="linux/arm64" ;;
+            ppc64le)     plats="linux/ppc64le" ;;
+            s390x)       plats="linux/s390x" ;;
+            amd64+arm64) plats="linux/amd64,linux/arm64" ;;
             *) echo "::error::unknown platforms input: $p"; exit 1 ;;
           esac
-          # Compact to single line for matrix consumption.
-          m=$(jq -c <<<"$m")
-          echo "matrix=$m" >> "$GITHUB_OUTPUT"
-          {
-            echo "## Build plan"
-            echo ""
-            echo "| event | ${{ github.event_name }} |"
-            echo "|---|---|"
-            echo "| ref | ${{ github.ref }} |"
-            echo "| platforms | ${p} |"
-            echo ""
-            echo '```json'
-            echo "$m"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  build:
-    needs: discover
-    name: Build (${{ matrix.platform }})
-    runs-on: [self-hosted, linux, "${{ matrix.runner }}"]
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.discover.outputs.matrix) }}
-    steps:
-      - name: Prepare
-        run: |
-          platform=${{ matrix.platform }}
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
-
-      - name: Check out the repo
-        uses: actions/checkout@v6
+          echo "platforms=$plats" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        if: matrix.qemu
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        id: buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.repository_owner }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Prepare version file
         run: ./hack/get_version.sh > .version
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-
-      - name: Build and push (by digest)
-        id: build
-        uses: docker/build-push-action@v7
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./docker/Dockerfile
-          platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=main-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=main-${{ matrix.arch }}
-          # provenance/sbom attestations create an extra manifest under the
-          # returned digest, which makes `imagetools create` fail in merge
-          # with "@sha256:... not found". Disable so push-by-digest returns
-          # the actual image manifest digest.
+          platforms: ${{ steps.prep.outputs.platforms }}
+          push: true
           provenance: false
           sbom: false
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            VERSION=${{ steps.prep.outputs.short_sha }}
+          # :main 永远滚动指向最新 main；:<sha> 固定可追溯到具体提交。
+          tags: |
+            ${{ steps.prep.outputs.image }}:main
+            ${{ steps.prep.outputs.image }}:${{ steps.prep.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=main
+          cache-to: type=gha,mode=max,scope=main
 
-      - name: Export digest
-        run: |
-          # Use runner.temp (auto-cleaned per job) instead of /tmp/digests;
-          # on long-lived self-hosted runners /tmp accumulates digests from
-          # every previous job and breaks subsequent merges.
-          mkdir -p "${RUNNER_TEMP}/digests"
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v7
-        with:
-          name: digests-main-${{ env.PLATFORM_PAIR }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  merge:
-    needs: [discover, build]
-    runs-on: [self-hosted, linux, X64]
-    steps:
-      - name: Download digests
-        uses: actions/download-artifact@v8
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: digests-main-*
-          merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create manifest list and push
-        working-directory: ${{ runner.temp }}/digests
-        run: |
-          # Use 8-char short SHA so the tag lines up with `git log --oneline`
-          # on this repo (git auto-extends past 7 once history grows), and the
-          # image at any tag maps trivially back to a commit.
-          short_sha="${GITHUB_SHA:0:8}"
-          docker buildx imagetools create \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${short_sha} \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
-
-      - name: Inspect image
-        run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+      - name: Inspect
+        run: docker buildx imagetools inspect ${{ steps.prep.outputs.image }}:main
