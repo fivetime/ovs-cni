@@ -169,9 +169,13 @@ jobs:
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         run: |
+          # Use 8-char short SHA so the tag lines up with `git log --oneline`
+          # on this repo (git auto-extends past 7 once history grows), and the
+          # image at any tag maps trivially back to a commit.
+          short_sha="${GITHUB_SHA:0:8}"
           docker buildx imagetools create \
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${short_sha} \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
       - name: Inspect image
